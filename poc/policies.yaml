@@ -1,0 +1,17 @@
+# Policies for the PoC stack. Paths match the secrets seeded by
+# seed-secrets.sh; clusters match the mock-agent SCP_CLUSTER values
+# in docker-compose.yml.
+
+policies:
+  - vault_path: secret/cluster_a/accounts-db
+    clusters: [cluster_a]
+  - vault_path: secret/cluster_a/ledger-db
+    clusters: [cluster_a]
+  - vault_path: secret/cluster_b/accounts-db
+    clusters: [cluster_b]
+  - vault_path: secret/cluster_b/ledger-db
+    clusters: [cluster_b]
+
+  # secret/shared/* fans out into both clusters.
+  - vault_path: secret/shared/*
+    clusters: [cluster_a, cluster_b]

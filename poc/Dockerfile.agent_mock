@@ -1,0 +1,11 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+COPY test_agent/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY test_agent/main.py .
+
+# -u: unbuffered stdout so docker logs surface lines immediately.
+CMD ["python", "-u", "main.py"]

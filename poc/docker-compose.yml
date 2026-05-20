@@ -1,0 +1,193 @@
+# End-to-end PoC stack for the Secret Control Panel.
+#
+# Brings up Vault (dev mode), Postgres, the three panel services
+# (scp-listener, scp-api, scp-daemon) and two Python mock agents that
+# mimic the cluster-side wire contract — no Kubernetes required.
+#
+# Two bootstrap one-shot containers wire it together:
+#   bootstrap-panel  — inserts a fixed dev api_token into Postgres
+#   bootstrap-vault  — enables the socket audit device to scp-listener
+#                      and seeds a few KV secrets for the demo
+#
+# Run:
+#   docker compose -f poc/docker-compose.yml up --build
+#
+# Trigger an event after everything is up:
+#   docker compose -f poc/docker-compose.yml exec vault \
+#     vault kv put secret/cluster_a/accounts-db user=app pass=rotated-$(date +%s)
+#
+# Tokens are baked in below — this stack is dev-only, never reuse outside.
+
+x-panel-env: &panel-env
+  SCP_DB_URL: postgres://scp:scp-dev-pw@postgres:5432/scp?sslmode=disable
+  SCP_LOG_LEVEL: info
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: scp
+      POSTGRES_PASSWORD: scp-dev-pw
+      POSTGRES_DB: scp
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U scp -d scp"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  vault:
+    image: hashicorp/vault:1.17
+    restart: unless-stopped
+    cap_add:
+      - IPC_LOCK
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: root
+      VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+      VAULT_ADDR: http://127.0.0.1:8200
+    healthcheck:
+      test: ["CMD", "vault", "status"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  scp-listener:
+    build:
+      context: ..
+      args:
+        CMMD: scp-listener
+    restart: unless-stopped
+    environment:
+      <<: *panel-env
+    command:
+      - --audit-addr=:9090
+      - --log-level=info
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  scp-api:
+    build:
+      context: ..
+      args:
+        CMMD: scp-api
+    restart: unless-stopped
+    environment:
+      <<: *panel-env
+    command:
+      - --listen=:8080
+      - --log-level=info
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  scp-daemon:
+    build:
+      context: ..
+      args:
+        CMMD: scp-daemon
+    restart: unless-stopped
+    environment:
+      <<: *panel-env
+    command:
+      - --policies=/etc/scp/policies.yaml
+      - --log-level=info
+    volumes:
+      - ./policies.yaml:/etc/scp/policies.yaml:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  bootstrap-panel:
+    image: postgres:16-alpine
+    restart: "no"
+    environment:
+      PGPASSWORD: scp-dev-pw
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        # Wait for scp-api to migrate the api_tokens table.
+        until psql -h postgres -U scp -d scp -c '\d api_tokens' >/dev/null 2>&1; do
+          echo "waiting for api_tokens table..."; sleep 1;
+        done
+        psql -h postgres -U scp -d scp -v ON_ERROR_STOP=1 -c \
+          "INSERT INTO api_tokens (token, active) VALUES ('00000000-0000-0000-0000-000000000001', true) ON CONFLICT (token) DO NOTHING"
+        echo "panel api token ready"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      scp-api:
+        condition: service_started
+
+  bootstrap-vault:
+    image: hashicorp/vault:1.17
+    restart: "no"
+    environment:
+      VAULT_ADDR: http://vault:8200
+      VAULT_TOKEN: root
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        # Retry audit enable: Vault sends a probe to the destination and
+        # refuses to enable if scp-listener is not yet accepting on :9090.
+        for i in $$(seq 1 30); do
+          if vault audit enable -path=scp-socket socket \
+               address=scp-listener:9090 socket_type=tcp log_raw=true 2>/tmp/err; then
+            echo "audit socket enabled"; exit 0
+          fi
+          if grep -q "path is already in use" /tmp/err; then
+            echo "audit already enabled"; exit 0
+          fi
+          echo "audit enable attempt $$i failed, retrying..."; sleep 2
+        done
+        echo "audit enable failed after 30 attempts"; exit 1
+    depends_on:
+      vault:
+        condition: service_healthy
+      scp-listener:
+        condition: service_started
+
+  mock-agent-a:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent_mock
+    restart: unless-stopped
+    environment:
+      SCP_CLUSTER: cluster_a
+      SCP_URL: http://mock-agent-a:8081
+      SCP_TOKEN: agent-a-secret
+      SCP_PANEL_URL: http://scp-api:8080
+      SCP_PANEL_TOKEN: 00000000-0000-0000-0000-000000000001
+      SCP_LISTEN_PORT: "8081"
+    depends_on:
+      scp-api:
+        condition: service_started
+      bootstrap-panel:
+        condition: service_completed_successfully
+
+  mock-agent-b:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent_mock
+    restart: unless-stopped
+    environment:
+      SCP_CLUSTER: cluster_b
+      SCP_URL: http://mock-agent-b:8081
+      SCP_TOKEN: agent-b-secret
+      SCP_PANEL_URL: http://scp-api:8080
+      SCP_PANEL_TOKEN: 00000000-0000-0000-0000-000000000001
+      SCP_LISTEN_PORT: "8081"
+    depends_on:
+      scp-api:
+        condition: service_started
+      bootstrap-panel:
+        condition: service_completed_successfully
+
+volumes:
+  pgdata:
