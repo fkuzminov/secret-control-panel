@@ -1,0 +1,101 @@
+# Compose for the SCP control plane. Images are built locally from the
+# shared Dockerfile; each service picks its binary via the CMMD arg.
+#
+# Layout:
+#   postgres       — single source of truth (versions, tasks, events, agents)
+#   scp-listener   — :9090 TCP, accepts Vault audit socket stream
+#   scp-api        — :8080 HTTP (internal), behind nginx
+#   scp-daemon     — workers (task fanout + event dispatch); no listening port
+#   nginx          — :443 HTTPS terminator for inbound from agents
+#
+# Required env (see .env.example):
+#   POSTGRES_PASSWORD
+#
+# Bootstrap an api token after first start:
+#   docker compose exec postgres psql -U scp -d scp \
+#     -c "INSERT INTO api_tokens DEFAULT VALUES RETURNING token;"
+#
+# Required files:
+#   policies.yaml      — daemon's routing table, mounted into scp-daemon
+#   nginx/nginx.conf   — nginx server config, mounted into nginx
+#   tls/scp.crt        — nginx server cert
+#   tls/scp.key        — nginx server key
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: scp
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?required}
+      POSTGRES_DB: scp
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U scp -d scp"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  scp-listener:
+    build:
+      context: .
+      args:
+        CMMD: scp-listener
+    restart: unless-stopped
+    environment:
+      SCP_DB_URL: postgres://scp:${POSTGRES_PASSWORD:?required}@postgres:5432/scp?sslmode=disable
+    command:
+      - --audit-addr=:9090
+      - --log-level=info
+    ports:
+      - "9090:9090"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  scp-api:
+    build:
+      context: .
+      args:
+        CMMD: scp-api
+    restart: unless-stopped
+    environment:
+      SCP_DB_URL: postgres://scp:${POSTGRES_PASSWORD:?required}@postgres:5432/scp?sslmode=disable
+    command:
+      - --listen=:8080
+      - --log-level=info
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  scp-daemon:
+    build:
+      context: .
+      args:
+        CMMD: scp-daemon
+    restart: unless-stopped
+    environment:
+      SCP_DB_URL: postgres://scp:${POSTGRES_PASSWORD:?required}@postgres:5432/scp?sslmode=disable
+    command:
+      - --policies=/etc/scp/policies.yaml
+      - --log-level=info
+    volumes:
+      - ./policies.yaml:/etc/scp/policies.yaml:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    ports:
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./tls:/etc/nginx/tls:ro
+    depends_on:
+      - scp-api
+
+volumes:
+  pgdata:
